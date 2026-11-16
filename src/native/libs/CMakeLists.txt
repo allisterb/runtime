@@ -146,9 +146,14 @@ if (CLR_CMAKE_TARGET_UNIX OR CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
     endif ()
 
     add_subdirectory(System.Native)
-    add_subdirectory(System.Globalization.Native)
+    if (NOT CLR_CMAKE_TARGET_QNX)
+        add_subdirectory(System.Globalization.Native)
+    endif ()
 
     if (CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
+        # skip for now
+    elseif (CLR_CMAKE_TARGET_QNX)
+        # QNX spike: System.Native only; globalization runs invariant, and crypto/GSSAPI are not ported yet.
         # skip for now
     elseif (CLR_CMAKE_TARGET_APPLE)
         if (NOT CLR_CMAKE_TARGET_TVOS) # no gssapi on tvOS, see https://developer.apple.com/documentation/gss

@@ -818,7 +818,12 @@ void SystemNative_GetDeviceIdentifiers(uint64_t dev, uint32_t* majorNumber, uint
 int32_t SystemNative_MkNod(const char* pathName, uint32_t mode, uint32_t major, uint32_t minor)
 {
 #if !defined(TARGET_WASI)
+#if defined(__QNXNTO__)
+    // QNX's makedev takes the network node too; 0 is the local node.
+    dev_t dev = (dev_t)makedev(0, major, minor);
+#else
     dev_t dev = (dev_t)makedev(major, minor);
+#endif
 
     int32_t result;
     while ((result = mknod(pathName, (mode_t)mode, dev)) < 0 && errno == EINTR);

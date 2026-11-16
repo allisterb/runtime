@@ -22,6 +22,21 @@ elseif (CLR_CMAKE_TARGET_SUNOS)
     # requires /opt/tools when building in Global Zone (GZ)
     include_directories(SYSTEM /opt/local/include /opt/tools/include)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fstack-protector")
+elseif (CLR_CMAKE_TARGET_QNX)
+    # _QNX_SOURCE exposes the BSD/POSIX extensions in QNX's headers.
+    add_definitions(-D_QNX_SOURCE)
+    set(CMAKE_REQUIRED_DEFINITIONS "${CMAKE_REQUIRED_DEFINITIONS} -D_QNX_SOURCE")
+    # stat/flock are already 64-bit on 64-bit QNX; the *64 structs need _LARGEFILE64_SOURCE, though libc
+    # exports the symbols, so the checks below would find them.
+    set(HAVE_STAT64 0)
+    set(HAVE_FLOCK64 0)
+    # Likewise the *64 calls: the headers alias them, but the target's libc exports only the plain names.
+    set(HAVE_LSEEK64 0)
+    set(HAVE_MMAP64 0)
+    set(HAVE_FTRUNCATE64 0)
+    set(HAVE_POSIX_FADVISE64 0)
+    # QNX does not support SA_RESTART (signal.h: "not supported yet"); callers retry on EINTR.
+    add_definitions(-DSA_RESTART=0)
 endif ()
 
 if(CLR_CMAKE_USE_SYSTEM_LIBUNWIND)

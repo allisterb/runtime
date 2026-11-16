@@ -64,6 +64,9 @@ static inline size_t minipal_get_current_thread_id_no_cache(void)
     tid = (size_t)find_thread(NULL);
 #elif defined(__sun)
     tid = (size_t)pthread_self();
+#elif defined(__QNXNTO__)
+    // pthread_t is the kernel thread ID within the process (the same value as gettid).
+    tid = (size_t)pthread_self();
 #elif defined(__wasm)
     tid = (size_t)(void*)pthread_self();
 #else

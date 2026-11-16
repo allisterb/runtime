@@ -946,6 +946,12 @@ static int8_t IsStreamSocket(int socket)
            && type == SOCK_STREAM;
 }
 
+#if !defined(IOV_MAX) && defined(__QNXNTO__)
+// QNX's limits.h leaves IOV_MAX undefined (it is sysconf(_SC_IOV_MAX)); the kernel limit is 1024
+// (devs/sys/syslimits.h).
+#define IOV_MAX 1024
+#endif
+
 static void ConvertMessageHeaderToMsghdr(struct msghdr* header, const MessageHeader* messageHeader, int socket)
 {
     // sendmsg/recvmsg can return EMSGSIZE when msg_iovlen is greater than IOV_MAX.

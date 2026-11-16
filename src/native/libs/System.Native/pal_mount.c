@@ -14,6 +14,11 @@
 // Check if we should use getfsstat or /proc/mounts
 #if HAVE_MNTINFO
 #include <sys/mount.h>
+#elif defined(__QNXNTO__)
+// QNX has no mount table (/proc/mounts, getmntent): mount points are resource managers in the path space.
+#include <sys/statvfs.h>
+// statvfs.f_basetype as on SunOS, sized __STATVFS_BASETYPE_CAPACITY.
+#define _FSTYPSZ __STATVFS_BASETYPE_CAPACITY
 #else
 #include <sys/statfs.h>
 #if HAVE_SYS_MNTENT_H
@@ -111,6 +116,12 @@ int32_t SystemNative_GetAllMountPoints(MountPointFound onFound, void* context)
     }
 
     free(mounts);
+    return 0;
+}
+
+#elif defined(__QNXNTO__)
+    // Spike: report only the root. A full version would walk the path space (e.g. /proc/mount).
+    onFound(context, "/");
     return 0;
 }
 

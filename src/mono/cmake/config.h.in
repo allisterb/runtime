@@ -54,6 +54,12 @@
 /* Targeting the Fuchsia platform */
 #cmakedefine HOST_FUCHSIA 1
 
+/* Host Platform is QNX Neutrino */
+#cmakedefine HOST_QNX 1
+
+/* Target Platform is QNX Neutrino */
+#cmakedefine TARGET_QNX 1
+
 /* Host Platform is Win32 */
 #cmakedefine HOST_WIN32 1
 
