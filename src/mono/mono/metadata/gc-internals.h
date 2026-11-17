@@ -306,6 +306,9 @@ void mono_gc_set_desktop_mode (void);
  */
 MONO_COMPONENT_API gboolean mono_gc_is_moving (void);
 
+/* qflat: TRUE if the GC needs barriers the JIT does not emit (incremental Boehm), so only --interpreter is safe. */
+gboolean mono_gc_requires_interpreter (void);
+
 typedef void* (*MonoGCLockedCallbackFunc) (void *data);
 
 void* mono_gc_invoke_with_gc_lock (MonoGCLockedCallbackFunc func, void *data);

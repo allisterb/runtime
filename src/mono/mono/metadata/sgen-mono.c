@@ -2319,6 +2319,12 @@ mono_gc_is_moving (void)
 }
 
 gboolean
+mono_gc_requires_interpreter (void)
+{
+	return FALSE;
+}
+
+gboolean
 mono_gc_is_disabled (void)
 {
 	return FALSE;

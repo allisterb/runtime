@@ -319,6 +319,16 @@ endif()
 
 set(monosgen-sources "${mini_sources}")
 
+# qflat: the GC's object library: SGen's, or bdwgc's for MONO_GC=boehm (see metadata/CMakeLists.txt).
+if(MONO_GC STREQUAL "boehm")
+  set(gc_objects bdwgc_objects)
+  if(NOT DISABLE_SHARED_LIBS OR HOST_WIN32)
+    message(FATAL_ERROR "MONO_GC=boehm builds only the static runtime: set DISABLE_SHARED_LIBS (not on Windows)")
+  endif()
+else()
+  set(gc_objects sgen_objects)
+endif()
+
 if(HOST_WIN32 AND NOT DISABLE_SHARED_LIBS)
   add_library(monosgen-objects_shared OBJECT "${monosgen-sources}")
   target_compile_definitions(monosgen-objects_shared PRIVATE -DMONO_DLL_EXPORT)
@@ -328,7 +338,7 @@ endif()
 add_library(monosgen-objects OBJECT "${monosgen-sources}")
 
 set(MONOSGEN_OBJECTS_LINKABLE_LIBS "")
-list(APPEND MONOSGEN_OBJECTS_LINKABLE_LIBS monoapi eglib_api utils_objects sgen_objects metadata_objects)
+list(APPEND MONOSGEN_OBJECTS_LINKABLE_LIBS monoapi eglib_api utils_objects ${gc_objects} metadata_objects)
 if (NOT CLR_CMAKE_USE_SYSTEM_ZLIB)
   list(APPEND MONOSGEN_OBJECTS_LINKABLE_LIBS zlib)
 endif()
@@ -338,7 +348,7 @@ if(NOT HOST_WIN32)
     target_compile_definitions(monosgen-objects PRIVATE -DMONO_DLL_EXPORT)
 endif()
 
-add_library(monosgen-static STATIC $<TARGET_OBJECTS:eglib_objects> $<TARGET_OBJECTS:utils_objects> $<TARGET_OBJECTS:sgen_objects> $<TARGET_OBJECTS:metadata_objects> $<TARGET_OBJECTS:monosgen-objects> $<TARGET_OBJECTS:minipal_objects>)
+add_library(monosgen-static STATIC $<TARGET_OBJECTS:eglib_objects> $<TARGET_OBJECTS:utils_objects> $<TARGET_OBJECTS:${gc_objects}> $<TARGET_OBJECTS:metadata_objects> $<TARGET_OBJECTS:monosgen-objects> $<TARGET_OBJECTS:minipal_objects>)
 set_target_properties(monosgen-static PROPERTIES OUTPUT_NAME ${MONO_LIB_NAME})
 target_link_libraries(monosgen-static PRIVATE dn-containers)
 

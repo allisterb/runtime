@@ -51,6 +51,7 @@ option (STATIC_COMPONENTS "Compile mono runtime components as static (not dynami
 option (ENABLE_WEBCIL "Enable the WebCIL loader")
 
 set (MONO_GC "sgen" CACHE STRING "Garbage collector implementation (sgen or boehm). Default: sgen")
+set (MONO_BDWGC_DIR "" CACHE PATH "qflat: bdwgc source tree compiled into the runtime when MONO_GC is boehm")
 set (GC_SUSPEND "default" CACHE STRING "GC suspend method (default, preemptive, coop, hybrid)")
 set (CHECKED_BUILD "" CACHE STRING "Set ENABLE_CHECKED_BUILD_ options at once.  Comma-separated list of lowercase ENABLE_CHECKED_BUILD_ options ie. 'private_types,gc,thread,metadata,casts' etc.")
 set (ENABLE_MINIMAL "" CACHE STRING "Set many DISABLE_ options at once. Comma-separated list of lowercase DISABLE_ options ie. 'jit,simd' etc.")

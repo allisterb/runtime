@@ -192,7 +192,28 @@ if(MONO_GC STREQUAL "sgen")
 elseif(MONO_GC STREQUAL "boehm")
     set(metadata_gc_sources
         boehm-gc.c)
-    set(metadata_compile_definitions "HAVE_BOEHM_GC")
+    # qflat: the runtime's own uses of gc.h register threads explicitly, so no pthread_create redirection.
+    set(metadata_compile_definitions HAVE_BOEHM_GC GC_THREADS GC_NO_THREAD_REDIRECTS)
+    if(NOT MONO_BDWGC_DIR)
+        message(FATAL_ERROR "MONO_GC=boehm needs MONO_BDWGC_DIR, the bdwgc source tree")
+    endif()
+    # qflat: bdwgc compiled from source (no libatomic_ops: compiler atomics), with the features Mono's
+    # Boehm glue uses (gcj-style descriptors, Java finalization, thread-local allocation).
+    set(bdwgc_sources alloc.c reclaim.c allchblk.c misc.c mach_dep.c os_dep.c mark_rts.c headers.c mark.c
+        obj_map.c blacklst.c finalize.c new_hblk.c dbg_mlc.c malloc.c dyn_load.c typd_mlc.c ptr_chck.c mallocx.c
+        gcj_mlc.c pthread_start.c pthread_support.c pthread_stop_world.c thread_local_alloc.c specific.c)
+    list(TRANSFORM bdwgc_sources PREPEND "${MONO_BDWGC_DIR}/")
+    if(HOST_QNX)
+        list(APPEND bdwgc_sources bdwgc-qnx.c)
+    endif()
+    add_library(bdwgc_objects OBJECT ${bdwgc_sources})
+    set_target_properties(bdwgc_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(bdwgc_objects PRIVATE "${MONO_BDWGC_DIR}/include")
+    target_compile_definitions(bdwgc_objects PRIVATE GC_THREADS _REENTRANT GC_BUILTIN_ATOMIC THREAD_LOCAL_ALLOC
+        GC_GCJ_SUPPORT JAVA_FINALIZATION GC_ATOMIC_UNCOLLECTABLE ALL_INTERIOR_POINTERS NO_EXECUTE_PERMISSION
+        USE_MMAP USE_MUNMAP GC_NOT_DLL)
+    # Mono's HAVE_CONFIG_H would make bdwgc include its own (autotools) config.h, which this build does not use.
+    target_compile_options(bdwgc_objects PRIVATE -w -UHAVE_CONFIG_H)
 endif()
 
 set(metadata_sources "${metadata_platform_sources};${metadata_common_sources};${metadata_gc_dependent_sources};${metadata_gc_sources};${ilgen_sources}")
@@ -229,10 +250,15 @@ target_link_libraries(metadata_objects PRIVATE ${METADATAOBJECTS_LINKABLE_LIBS})
 
 # note: metadata_objects is an object library, so this doesn't force linking with sgen,
 # it just adds the relevant include directories - which we need even with Boehm
-target_link_libraries(metadata_objects PRIVATE sgen_objects)
+if(TARGET sgen_objects) # qflat: MONO_GC=boehm builds no sgen_objects
+  target_link_libraries(metadata_objects PRIVATE sgen_objects)
+endif()
 if(NOT HOST_WIN32)
     target_compile_definitions(metadata_objects PRIVATE -DMONO_DLL_EXPORT)
 endif()
 target_include_directories(metadata_objects PRIVATE ${PROJECT_BINARY_DIR}/../..
   ${PROJECT_SOURCE_DIR}/../..
   ${PROJECT_SOURCE_DIR}/..)
+if(MONO_GC STREQUAL "boehm")
+  target_include_directories(metadata_objects PRIVATE "${MONO_BDWGC_DIR}/include")
+endif()

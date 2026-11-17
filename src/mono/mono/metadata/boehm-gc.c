@@ -55,9 +55,69 @@ void *pthread_get_stackaddr_np(pthread_t);
 static gboolean gc_initialized = FALSE;
 static gboolean gc_dont_gc_env = FALSE;
 
+/*
+ * qflat: incremental collection (MONO_GC_PARAMS=incremental[=<budget us>]). bdwgc built with MANUAL_VDB rescans only
+ * heap pages marked dirty since the last increment, so every reference store must mark the page it wrote: the
+ * barriers below do, after the store. The JIT emits no barriers for a non-moving GC, so this needs --interpreter
+ * (mini_init checks mono_gc_requires_interpreter ()).
+ *
+ * The budget is bdwgc's GC_time_limit: it bounds only the first attempt at the final stopped mark, so the final
+ * pause is not bounded (it rescans the roots and every dirty marked block). Measure pauses; do not assume them.
+ */
+#define DEFAULT_INCREMENTAL_BUDGET_US 2000
+#define MAX_INCREMENTAL_BUDGET_US 10000000
+static gboolean gc_incremental = FALSE;
+
+static inline void
+gc_dirty (const void *p)
+{
+	if (G_UNLIKELY (gc_incremental))
+		GC_end_stubborn_change (p); /* bdwgc's public GC_dirty */
+}
+
+/* A range is always inside one object, and bdwgc treats an object on a dirty page as dirty as a whole. */
+static inline void
+gc_dirty_range (const void *p, size_t size)
+{
+	if (size)
+		gc_dirty (p);
+}
+
+static void
+gc_enable_incremental (const char *budget_us)
+{
+	guint64 us = DEFAULT_INCREMENTAL_BUDGET_US;
+	if (budget_us) {
+		char *end = NULL;
+		us = (*budget_us >= '0' && *budget_us <= '9') ? strtoull (budget_us, &end, 10) : 0;
+		if (!us || us > MAX_INCREMENTAL_BUDGET_US || *end) {
+			fprintf (stderr, "incremental=N: N is bdwgc's stopped-mark budget in microseconds, 1 to %d.\n",
+				MAX_INCREMENTAL_BUDGET_US);
+			exit (1);
+		}
+	}
+	GC_enable_incremental ();
+	GC_set_time_limit_ns (us * 1000);
+	gc_incremental = GC_is_incremental_mode ();
+	if (!gc_incremental) {
+		fprintf (stderr, "MONO_GC_PARAMS=incremental: bdwgc could not enable incremental mode.\n");
+		exit (1);
+	}
+	/* qflat: confirms the mode took effect (tools/mono_gcbench.py checks for this line) */
+	fprintf (stderr, "[MONO_BOEHM] incremental budget_us=%" PRIu64 "\n", (uint64_t)us);
+}
+
+gboolean
+mono_gc_requires_interpreter (void)
+{
+	return gc_incremental;
+}
+
 static mono_mutex_t mono_gc_lock;
 
 static GC_push_other_roots_proc default_push_other_roots;
+/* qflat: only interp_mark_func is used (see mono_push_other_roots); Boehm scans native stacks itself. */
+static MonoGCCallbacks gc_callbacks;
 static GHashTable *roots;
 
 static void
@@ -179,6 +239,9 @@ mono_gc_base_init (void)
 				continue;
 			} else if (g_str_has_prefix (opt, "toggleref-test")) {
 				register_test_toggleref_callback ();
+				continue;
+			} else if (!strcmp (opt, "incremental") || g_str_has_prefix (opt, "incremental=")) {
+				gc_enable_incremental (opt [strlen ("incremental")] == '=' ? opt + strlen ("incremental=") : NULL);
 				continue;
 			} else {
 				/* Could be a parameter for sgen */
@@ -414,6 +477,9 @@ mono_gc_walk_heap (int flags, MonoGCReferences callback, void *data)
 }
 
 static gint64 gc_start_time;
+/* qflat: set between POST_STOP_WORLD and PRE_START_WORLD (only the collecting thread reads it then) */
+static gboolean gc_world_stopped;
+static gint64 gc_stw_start;
 
 static void
 on_gc_notification (GC_EventType event)
@@ -424,21 +490,30 @@ on_gc_notification (GC_EventType event)
 	case GC_EVENT_PRE_STOP_WORLD:
 		e = MONO_GC_EVENT_PRE_STOP_WORLD;
 		MONO_GC_WORLD_STOP_BEGIN ();
+		/* qflat: the pause includes suspending and restarting the threads, as SGen's "stw" does */
+		gc_stw_start = mono_100ns_ticks ();
 		break;
 
 	case GC_EVENT_POST_STOP_WORLD:
 		e = MONO_GC_EVENT_POST_STOP_WORLD;
 		MONO_GC_WORLD_STOP_END ();
+		gc_world_stopped = TRUE;
 		break;
 
 	case GC_EVENT_PRE_START_WORLD:
 		e = MONO_GC_EVENT_PRE_START_WORLD;
 		MONO_GC_WORLD_RESTART_BEGIN (1);
+		gc_world_stopped = FALSE;
 		break;
 
 	case GC_EVENT_POST_START_WORLD:
 		e = MONO_GC_EVENT_POST_START_WORLD;
 		MONO_GC_WORLD_RESTART_END (1);
+		/* qflat: one line per stop-the-world pause (suspend to restart), for tools/mono_gcbench.py
+		 * (MONO_LOG_MASK=gc); logged after the restart, since a stopped thread may hold a lock the logger needs.
+		 * The tag is the GC mode, not the kind of pause. */
+		mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_GC, "GC_BOEHM_STW: (%s-mode) stw %.2fms",
+			gc_incremental ? "incremental" : "stw", (mono_100ns_ticks () - gc_stw_start) / 10000.0);
 		break;
 
 	case GC_EVENT_START:
@@ -545,10 +620,15 @@ mono_gc_deregister_root (char* addr)
 	MONO_PROFILER_RAISE (gc_root_unregister, ((const mono_byte *) addr));
 }
 
+/*
+ * qflat: roots are scanned eagerly (GC_push_all_eager), not queued as ranges (GC_push_all). A queued range uses a
+ * mark-stack entry and bdwgc aborts on overflow there, and it is read when the mark stack drains, possibly after
+ * the world restarts and the range was freed (fixed memory, a dead thread's interpreter stack).
+ */
 static void
 push_root (gpointer key, gpointer value, gpointer user_data)
 {
-	GC_push_all (key, value);
+	GC_push_all_eager (key, value);
 }
 
 static void
@@ -562,22 +642,40 @@ push_handle_stack (HandleStack* stack)
 
 	while (cur) {
 		if (cur->size > 0)
-			GC_push_all ((gpointer)&cur->elems[0], (char*)(cur->elems + cur->size) + 1);
+			GC_push_all_eager ((gpointer)&cur->elems[0], (char*)(cur->elems + cur->size) + 1);
 		if (cur == last)
 			break;
 		cur = cur->next;
 	}
 }
 
+/* qflat: one interpreter stack slot, scanned conservatively like a native stack word. */
+static void
+push_interp_slot (gpointer *slot, gpointer gc_data)
+{
+	if (*slot)
+		GC_push_all_eager (slot, (char *)(slot + 1));
+}
+
 static void
 mono_push_other_roots (void)
 {
 	g_hash_table_foreach (roots, push_root, NULL);
-	FOREACH_THREAD_EXCLUDE (info, MONO_THREAD_INFO_FLAGS_NO_GC) {
-		HandleStack* stack = info->handle_stack;
-		if (stack)
-			push_handle_stack (stack);
-	} FOREACH_THREAD_END
+	/*
+	 * qflat: other threads' handle stacks and interpreter frames are walked only with the world stopped. Incremental
+	 * bdwgc can push roots while threads run; the final stopped mark pushes them again, and that push is the one that
+	 * counts.
+	 */
+	if (gc_world_stopped) {
+		FOREACH_THREAD_EXCLUDE (info, MONO_THREAD_INFO_FLAGS_NO_GC) {
+			HandleStack* stack = info->handle_stack;
+			if (stack)
+				push_handle_stack (stack);
+			/* qflat: interpreter frames live in their own mapping, which Boehm does not scan by itself. */
+			if (gc_callbacks.interp_mark_func)
+				gc_callbacks.interp_mark_func (info, push_interp_slot, NULL, FALSE);
+		} FOREACH_THREAD_END
+	}
 	if (default_push_other_roots)
 		default_push_other_roots ();
 }
@@ -660,11 +758,17 @@ mono_gc_make_root_descr_all_refs (int numbits)
 	return NULL;
 }
 
+/*
+ * qflat: fixed memory is malloc'd and registered as a root, not GC_MALLOC_UNCOLLECTABLE. The runtime stores into it
+ * without barriers (SGen treats it as a root), and incremental bdwgc rescans uncollectable blocks at the final pause
+ * only when dirty; registered roots are rescanned in full every time.
+ */
 MonoObject*
 mono_gc_alloc_fixed (size_t size, void *descr, MonoGCRootSource source, void *key, const char *msg)
 {
-	void *start = GC_MALLOC_UNCOLLECTABLE (size);
-	MONO_PROFILER_RAISE (gc_root_register, ((const mono_byte *) start, size, source, key, msg));
+	g_assert (size);
+	void *start = g_malloc0 (size);
+	mono_gc_register_root ((char *)start, size, descr, source, key, msg);
 	return (MonoObject*)start;
 }
 
@@ -677,8 +781,10 @@ mono_gc_alloc_fixed_no_descriptor (size_t size, MonoGCRootSource source, void *k
 void
 mono_gc_free_fixed (void* addr)
 {
-	MONO_PROFILER_RAISE (gc_root_unregister, ((const mono_byte *) addr));
-	GC_FREE (addr);
+	if (!addr)
+		return;
+	mono_gc_deregister_root ((char *)addr);
+	g_free (addr);
 }
 
 MonoObject*
@@ -843,49 +949,58 @@ void
 mono_gc_wbarrier_set_field_internal (MonoObject *obj, gpointer field_ptr, MonoObject* value)
 {
 	*(void**)field_ptr = value;
+	gc_dirty (field_ptr);
 }
 
 void
 mono_gc_wbarrier_set_arrayref_internal (MonoArray *arr, gpointer slot_ptr, MonoObject* value)
 {
 	*(void**)slot_ptr = value;
+	gc_dirty (slot_ptr);
 }
 
 void
 mono_gc_wbarrier_arrayref_copy_internal (gpointer dest_ptr, gconstpointer src_ptr, int count)
 {
 	mono_gc_memmove_aligned (dest_ptr, src_ptr, count * sizeof (gpointer));
+	gc_dirty_range (dest_ptr, count * sizeof (gpointer));
 }
 
 void
 mono_gc_wbarrier_generic_store_internal (void volatile* ptr, MonoObject* value)
 {
 	*(void**)ptr = value;
+	gc_dirty ((const void *)ptr);
 }
 
 void
 mono_gc_wbarrier_generic_store_atomic_internal (gpointer ptr, MonoObject *value)
 {
 	mono_atomic_store_ptr ((volatile gpointer *)ptr, value);
+	gc_dirty (ptr);
 }
 
 void
 mono_gc_wbarrier_generic_nostore_internal (gpointer ptr)
 {
+	gc_dirty (ptr);
 }
 
 void
 mono_gc_wbarrier_value_copy_internal (gpointer dest, gconstpointer src, int count, MonoClass *klass)
 {
-	mono_gc_memmove_atomic (dest, src, count * mono_class_value_size (klass, NULL));
+	size_t size = count * mono_class_value_size (klass, NULL);
+	mono_gc_memmove_atomic (dest, src, size);
+	gc_dirty_range (dest, size);
 }
 
 void
 mono_gc_wbarrier_object_copy_internal (MonoObject* obj, MonoObject *src)
 {
 	/* do not copy the sync state */
-	mono_gc_memmove_aligned (mono_object_get_data (obj), (char*)src + MONO_ABI_SIZEOF (MonoObject),
-				m_class_get_instance_size (mono_object_class (obj)) - MONO_ABI_SIZEOF (MonoObject));
+	size_t size = m_class_get_instance_size (mono_object_class (obj)) - MONO_ABI_SIZEOF (MonoObject);
+	mono_gc_memmove_aligned (mono_object_get_data (obj), (char*)src + MONO_ABI_SIZEOF (MonoObject), size);
+	gc_dirty_range (mono_object_get_data (obj), size);
 }
 
 int
@@ -997,7 +1112,9 @@ mono_gc_is_disabled (void)
 void
 mono_gc_wbarrier_range_copy (gpointer _dest, gconstpointer _src, int size)
 {
-	g_assert_not_reached ();
+	/* qflat: reached only from JIT code that emits barriers, which a non-moving GC does not get today */
+	mono_gc_memmove_aligned (_dest, _src, size);
+	gc_dirty_range (_dest, size);
 }
 
 MonoRangeCopyFunction
@@ -1081,6 +1198,7 @@ mono_gc_get_bitmap_for_descr (void *descr, int *numbits)
 void
 mono_gc_set_gc_callbacks (MonoGCCallbacks *callbacks)
 {
+	gc_callbacks = *callbacks;
 }
 
 void

@@ -4840,6 +4840,17 @@ mini_init (const char *filename)
 
 	domain = mono_init (filename);
 
+	/*
+	 * qflat: incremental Boehm needs a barrier on every reference store; JIT and AOT code has none for a non-moving
+	 * GC. So only pure interpretation: no AOT-only mode and no --interp=jit=<class> exceptions.
+	 */
+	if (mono_gc_requires_interpreter () && (!mono_use_interpreter || mono_aot_only
+			|| (mono_interp_opts_string && strstr (mono_interp_opts_string, "jit=")))) {
+		fprintf (stderr, "MONO_GC_PARAMS=incremental needs pure interpretation: --interpreter, without AOT-only "
+			"mode or --interp=jit=.\n");
+		exit (1);
+	}
+
 	if (mono_compile_aot)
 		mono_component_diagnostics_server ()->disable ();
 
