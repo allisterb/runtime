@@ -341,8 +341,16 @@ intptr_t SystemNative_Open(const char* path, int32_t flags, int32_t mode)
     return result;
 }
 
+#if defined(__QNXNTO__)
+// pal_networking.c, qflat: drops the QNX socket event port's registrations of fd, before its number can be reused.
+void SystemNative_QnxForgetFd(int fd);
+#endif
+
 int32_t SystemNative_Close(intptr_t fd)
 {
+#if defined(__QNXNTO__)
+    SystemNative_QnxForgetFd(ToFileDescriptor(fd));
+#endif
     int result = close(ToFileDescriptor(fd));
     if (result < 0 && errno == EINTR) result = 0; // on all supported platforms, close(2) returning EINTR still means it was released
     return result;
@@ -1116,9 +1124,23 @@ int32_t SystemNative_FTruncate(intptr_t fd, int64_t length)
     return result;
 }
 
+#if defined(__QNXNTO__)
+// pal_networking.c, qflat: poll() cancels the QNX socket event port's notifications on the fds it polls; re-arm them.
+void SystemNative_QnxRearmPolled(const PollEvent* pollEvents, uint32_t eventCount);
+#endif
+
 int32_t SystemNative_Poll(PollEvent* pollEvents, uint32_t eventCount, int32_t milliseconds, uint32_t* triggered)
 {
+#if defined(__QNXNTO__)
+    int32_t result = Common_Poll(pollEvents, eventCount, milliseconds, triggered);
+    if (pollEvents != NULL)
+    {
+        SystemNative_QnxRearmPolled(pollEvents, eventCount);
+    }
+    return result;
+#else
     return Common_Poll(pollEvents, eventCount, milliseconds, triggered);
+#endif
 }
 
 int32_t SystemNative_PosixFAdvise(intptr_t fd, int64_t offset, int64_t length, int32_t advice)

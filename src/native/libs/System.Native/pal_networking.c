@@ -149,6 +149,37 @@ struct in_pktinfo
     #define LINGER_OPTION_NAME SO_LINGER
 #endif
 
+#if defined(__QNXNTO__)
+// qflat: on QNX every socket call is a message to io-sock, and a signal (each Boehm GC stop, which QNX cannot hide
+// with SA_RESTART) can interrupt even calls that never block, such as listen(), with EINTR. Retrying is not safe for
+// all of them (a bind() that took effect fails the second time), so these quick calls run with signals blocked.
+// Calls that can block (accept, connect, send, recv) must stay interruptible, or a GC would wait for them; they
+// handle EINTR themselves.
+#include <signal.h>
+#include <sys/iomsg.h>
+#include <sys/neutrino.h>
+#include <sys/stat.h>
+#define QNX_NO_SIGNALS(call) __extension__ ({                          \
+        sigset_t qnxAll_, qnxPrevious_;                                \
+        sigfillset(&qnxAll_);                                          \
+        pthread_sigmask(SIG_BLOCK, &qnxAll_, &qnxPrevious_);           \
+        __typeof__(call) qnxResult_ = (call);                          \
+        int qnxErrno_ = errno;                                         \
+        pthread_sigmask(SIG_SETMASK, &qnxPrevious_, NULL);             \
+        errno = qnxErrno_;                                             \
+        qnxResult_;                                                    \
+    })
+#define socket(...) QNX_NO_SIGNALS(socket(__VA_ARGS__))
+#define bind(...) QNX_NO_SIGNALS(bind(__VA_ARGS__))
+#define listen(...) QNX_NO_SIGNALS(listen(__VA_ARGS__))
+#define setsockopt(...) QNX_NO_SIGNALS(setsockopt(__VA_ARGS__))
+#define getsockopt(...) QNX_NO_SIGNALS(getsockopt(__VA_ARGS__))
+#define getsockname(...) QNX_NO_SIGNALS(getsockname(__VA_ARGS__))
+#define getpeername(...) QNX_NO_SIGNALS(getpeername(__VA_ARGS__))
+#define shutdown(...) QNX_NO_SIGNALS(shutdown(__VA_ARGS__))
+void SystemNative_QnxRearmPolled(const PollEvent* pollEvents, uint32_t eventCount);
+#endif
+
 enum
 {
     INET6_ADDRSTRLEN_MANAGED = 65 // Managed code has a longer max IPv6 string length
@@ -1788,6 +1819,32 @@ int32_t SystemNative_Bind(intptr_t socket, int32_t protocolType, uint8_t* socket
     return err == 0 ? Error_SUCCESS : SystemNative_ConvertErrorPlatformToPal(errno);
 }
 
+#if defined(__QNXNTO__)
+// Waits for a blocking socket's connection attempt to finish and returns its result (qflat). A QNX poll() can return
+// before anything happened when a signal interrupts it, so only POLLOUT or an error ends the wait.
+static int32_t WaitForConnect(int fd)
+{
+    PollEvent polled = { .FileDescriptor = fd, .Events = PAL_POLLOUT, .TriggeredEvents = 0 };
+    struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+    int rv;
+    while (((rv = poll(&pfd, 1, -1)) < 0 && errno == EINTR) ||
+           (rv >= 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) == 0));
+    int pollErrno = errno;
+    SystemNative_QnxRearmPolled(&polled, 1); // poll() cancelled the socket event port's arming, if registered
+    if (rv < 0)
+    {
+        return SystemNative_ConvertErrorPlatformToPal(pollErrno);
+    }
+    int soError = 0;
+    socklen_t soErrorLen = sizeof(soError);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &soErrorLen) != 0)
+    {
+        return SystemNative_ConvertErrorPlatformToPal(errno);
+    }
+    return soError == 0 ? Error_SUCCESS : SystemNative_ConvertErrorPlatformToPal(soError);
+}
+#endif
+
 int32_t SystemNative_Connect(intptr_t socket, uint8_t* socketAddress, int32_t socketAddressLen)
 {
     if (socketAddress == NULL || socketAddressLen < 0)
@@ -1797,9 +1854,34 @@ int32_t SystemNative_Connect(intptr_t socket, uint8_t* socketAddress, int32_t so
 
     int fd = ToFileDescriptor(socket);
 
+#if defined(__QNXNTO__)
+    // qflat: on QNX an EINTR from connect() is ambiguous. The signal may have arrived before io-sock received the
+    // request (no connection attempt exists) or while it was being handled. So connect() runs non-blocking with
+    // signals blocked, which returns at once, and a blocking socket then waits for the attempt in poll(), which a
+    // signal can interrupt safely.
+    int flags = QNX_NO_SIGNALS(fcntl(fd, F_GETFL));
+    bool blocking = flags != -1 && (flags & O_NONBLOCK) == 0;
+    if (blocking && QNX_NO_SIGNALS(fcntl(fd, F_SETFL, flags | O_NONBLOCK)) == -1)
+    {
+        return SystemNative_ConvertErrorPlatformToPal(errno);
+    }
+    int err = QNX_NO_SIGNALS(connect(fd, (struct sockaddr*)socketAddress, (socklen_t)socketAddressLen));
+    int connectErrno = errno;
+    if (blocking)
+    {
+        QNX_NO_SIGNALS(fcntl(fd, F_SETFL, flags));
+    }
+    if (err == 0)
+    {
+        return Error_SUCCESS;
+    }
+    return !blocking || connectErrno != EINPROGRESS ? SystemNative_ConvertErrorPlatformToPal(connectErrno)
+                                                    : WaitForConnect(fd);
+#else
     int err;
     while ((err = connect(fd, (struct sockaddr*)socketAddress, (socklen_t)socketAddressLen)) < 0 && errno == EINTR);
     return err == 0 ? Error_SUCCESS : SystemNative_ConvertErrorPlatformToPal(errno);
+#endif
 }
 
 #if defined(__linux__) && !defined(TCP_FASTOPEN_CONNECT)
@@ -3394,6 +3476,511 @@ static int32_t WaitForSocketEventsInner(int32_t port, SocketEvent* buffer, int32
         memset(&buffer[i], 0, sizeof(SocketEvent));
         buffer[i].Data = GetSocketEventData(evt.udata);
         buffer[i].Events = GetSocketEvents(GetKeventFilter(evt.filter), GetKeventFlags(evt.flags));
+    }
+
+    *count = numEvents;
+    return Error_SUCCESS;
+}
+
+#elif defined(__QNXNTO__)
+
+// qflat: QNX has neither epoll nor kqueue. Its native equivalent is ionotify(): the resource manager behind an fd
+// (io-sock for sockets, the pipe manager for pipes) delivers a registered pulse to a channel when a condition is met.
+// _NOTIFY_ACTION_EDGEARM returns the conditions that changed since the previous EDGEARM call and arms a one-shot
+// notification for the rest, which gives the edge-triggered contract that epoll's EPOLLET provides here:
+// - a socket is registered once; any condition already met is handed to the event thread with a self-pulse;
+// - on a pulse the event thread re-arms the fd before reporting it, so data that arrives after a consumer's EAGAIN is
+//   either reported by that pulse's event or by a later pulse.
+// Measured on QNX 8 (io-sock and the pipe manager):
+// - conditions EDGEARM returns as met are not armed, so arming repeats until it returns none;
+// - TCP reports each new arrival as a change, pipes only the empty-to-non-empty transition;
+// - poll() on the fd (managed code polls registered sockets, e.g. after an async connect) cancels the arming, and the
+//   next EDGEARM still reports what changed meanwhile. So SystemNative_Poll re-arms registered fds after polling
+//   (SystemNative_QnxRearmPolled). A poll() that blocks while the event thread arms the same fd can in turn lose its
+//   wakeup and sleep to its timeout. The runtime only polls registered sockets with a zero timeout; Socket.Poll or
+//   Socket.Select with a timeout on a socket also used asynchronously is a known limitation.
+// - ionotify(_NOTIFY_ACTION_POLL) consumes the change EDGEARM would report (a level check at registration made every
+//   async connect stall), so it is never used on a registered fd;
+// - managed code never unregisters a socket, it closes it, so SystemNative_Close drops the fd's registrations first
+//   (SystemNative_QnxForgetFd); a registration that outlived its socket could consume the next socket's edge.
+// The channel has a fixed priority: a pulse would otherwise drop the event thread to the process's initial priority
+// (SIGEV_PULSE_PRIO_INHERIT), where busier threads can starve it. The port handle is an fd on /dev/null, so that the
+// managed side sees a file descriptor. Ports are freed only when the managed engine fails to start.
+
+#define QNX_NOTIFY_CONDS (_NOTIFY_COND_INPUT | _NOTIFY_COND_OUTPUT | _NOTIFY_COND_OBAND)
+#define QNX_PULSE_CODE (_PULSE_CODE_MINAVAIL + 7)
+#define QNX_ARM_ATTEMPTS 8
+#define QNX_FD_BITS 20 // a pulse value is the fd and, above it, the registration's generation
+#define QNX_FD_MASK ((1 << QNX_FD_BITS) - 1)
+#define QNX_GENERATION_MASK ((1 << (31 - QNX_FD_BITS)) - 1)
+#define QNX_MAX_PORTS 64
+
+static const size_t SocketEventBufferElementSize = sizeof(SocketEvent);
+
+typedef struct
+{
+    struct sigevent Event; // registered with MsgRegisterEvent
+    uintptr_t Data;        // the managed context index
+    int32_t Mask;          // SocketEvents the caller asked for
+    int32_t Pending;       // _NOTIFY_COND_* met at arming time and not yet reported
+    uint32_t Generation;   // bumped per registration, carried in its pulses: pulses of an earlier one are dropped
+    mode_t Type;           // S_IFMT of the registered object, to notice an fd number reused by another kind of object
+    bool Registered;
+} QnxRegistration;
+
+typedef struct QnxEventPort
+{
+    struct QnxEventPort* Next;
+    int KeyFd;
+    int Chid;
+    int Coid;
+    pthread_mutex_t Lock;
+    int Capacity; // Registrations, indexed by fd; grows under Lock
+    QnxRegistration* Registrations;
+} QnxEventPort;
+
+static pthread_mutex_t s_qnxPortsLock = PTHREAD_MUTEX_INITIALIZER;
+static QnxEventPort* s_qnxPorts;
+
+static QnxEventPort* FindQnxPort(int keyFd)
+{
+    pthread_mutex_lock(&s_qnxPortsLock);
+    QnxEventPort* port = s_qnxPorts;
+    while (port != NULL && port->KeyFd != keyFd)
+    {
+        port = port->Next;
+    }
+    pthread_mutex_unlock(&s_qnxPortsLock);
+    return port;
+}
+
+// ionotify() is a message to the resource manager. A signal (a Boehm GC stop, say) can unblock it with EINTR after the
+// manager has processed the EDGEARM, and the conditions it returned as met would then be lost for good. So all arming
+// runs with signals blocked. Every holder of a port's Lock blocks them before taking it, so a GC never suspends a
+// thread that holds it; s_qnxPortsLock is only ever taken with signals unblocked.
+static void BlockQnxSignals(sigset_t* previous)
+{
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, previous);
+}
+
+static void RestoreQnxSignals(const sigset_t* previous)
+{
+    pthread_sigmask(SIG_SETMASK, previous, NULL);
+}
+
+static int QnxPulseValue(int fd, const QnxRegistration* reg)
+{
+    return (int)(((reg->Generation & QNX_GENERATION_MASK) << QNX_FD_BITS) | (uint32_t)fd);
+}
+
+static mode_t GetQnxObjectType(int fd)
+{
+    struct stat st;
+    return fstat(fd, &st) == 0 ? (st.st_mode & S_IFMT) : 0;
+}
+
+static int32_t GetQnxSocketEvents(int conds, int32_t mask)
+{
+    // Out-of-band data or an error: let both queues retry, as epoll's EPOLLERR handling does.
+    int32_t events = ((conds & (_NOTIFY_COND_INPUT | _NOTIFY_COND_OBAND)) != 0 ? SocketEvents_SA_READ : 0) |
+                     ((conds & (_NOTIFY_COND_OUTPUT | _NOTIFY_COND_OBAND)) != 0 ? SocketEvents_SA_WRITE : 0);
+    return events & mask;
+}
+
+static void UnregisterQnxRegistration(QnxRegistration* reg)
+{
+    if (reg->Registered)
+    {
+        MsgUnregisterEvent(&reg->Event);
+        reg->Registered = false;
+        reg->Pending = 0;
+    }
+}
+
+// Under p->Lock: makes Registrations[fd] exist. False if out of memory.
+static bool EnsureQnxCapacity(QnxEventPort* p, int fd)
+{
+    if (fd < p->Capacity)
+    {
+        return true;
+    }
+    int capacity = p->Capacity * 2 > fd + 1 ? p->Capacity * 2 : fd + 1;
+    QnxRegistration* regs = (QnxRegistration*)realloc(p->Registrations, (size_t)capacity * sizeof(QnxRegistration));
+    if (regs == NULL)
+    {
+        return false;
+    }
+    memset(&regs[p->Capacity], 0, (size_t)(capacity - p->Capacity) * sizeof(QnxRegistration));
+    p->Registrations = regs;
+    p->Capacity = capacity;
+    return true;
+}
+
+// Edge-arms fd until no condition is returned as met. Returns the conditions met, or -1 with errno set if arming
+// failed; on EBADF (the fd was closed) the registration is dropped. *armed is false if it gave up while conditions
+// kept changing.
+static int ArmQnxRegistration(QnxRegistration* reg, int fd, bool* armed)
+{
+    int met = 0;
+    *armed = false;
+    for (int i = 0; i < QNX_ARM_ATTEMPTS; i++)
+    {
+        int conds = ionotify(fd, _NOTIFY_ACTION_EDGEARM, QNX_NOTIFY_CONDS, &reg->Event);
+        if (conds == -1)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            int error = errno;
+            if (error == EBADF)
+            {
+                UnregisterQnxRegistration(reg);
+            }
+            errno = error;
+            return -1;
+        }
+        conds &= QNX_NOTIFY_CONDS;
+        if (conds == 0)
+        {
+            *armed = true;
+            break;
+        }
+        met |= conds;
+    }
+    return met;
+}
+
+// Under p->Lock: re-arms a registered fd and hands what changed to the event thread. For SystemNative_QnxRearmPolled.
+static void RearmQnxRegistration(QnxEventPort* p, int fd)
+{
+    if (fd < 0 || fd >= p->Capacity || !p->Registrations[fd].Registered)
+    {
+        return;
+    }
+    QnxRegistration* reg = &p->Registrations[fd];
+    bool armed;
+    int met = ArmQnxRegistration(reg, fd, &armed);
+    if (met > 0 || (met == 0 && !armed))
+    {
+        reg->Pending |= met;
+        MsgSendPulse(p->Coid, -1, QNX_PULSE_CODE, QnxPulseValue(fd, reg));
+    }
+}
+
+// Snapshots the ports with signals unblocked (s_qnxPortsLock is never taken with them blocked). Returns the count.
+static int SnapshotQnxPorts(QnxEventPort** ports)
+{
+    int portCount = 0;
+    pthread_mutex_lock(&s_qnxPortsLock);
+    for (QnxEventPort* p = s_qnxPorts; p != NULL && portCount < QNX_MAX_PORTS; p = p->Next)
+    {
+        ports[portCount++] = p;
+    }
+    pthread_mutex_unlock(&s_qnxPortsLock);
+    return portCount;
+}
+
+// Managed code never unregisters a socket, it just closes it. A registration that outlived its socket would be armed
+// on the next object to get the same fd number by a pulse still queued for the old one, consuming the new socket's
+// edge (a connect that then never completes). So SystemNative_Close drops it first.
+void SystemNative_QnxForgetFd(int fd)
+{
+    QnxEventPort* ports[QNX_MAX_PORTS];
+    int portCount = SnapshotQnxPorts(ports);
+    for (int i = 0; i < portCount; i++)
+    {
+        sigset_t signals;
+        BlockQnxSignals(&signals);
+        pthread_mutex_lock(&ports[i]->Lock);
+        if (fd >= 0 && fd < ports[i]->Capacity)
+        {
+            UnregisterQnxRegistration(&ports[i]->Registrations[fd]);
+        }
+        pthread_mutex_unlock(&ports[i]->Lock);
+        RestoreQnxSignals(&signals);
+    }
+}
+
+void SystemNative_QnxRearmPolled(const PollEvent* pollEvents, uint32_t eventCount)
+{
+    QnxEventPort* ports[QNX_MAX_PORTS];
+    int portCount = SnapshotQnxPorts(ports);
+    for (int i = 0; i < portCount; i++)
+    {
+        sigset_t signals;
+        BlockQnxSignals(&signals);
+        pthread_mutex_lock(&ports[i]->Lock);
+        for (uint32_t j = 0; j < eventCount; j++)
+        {
+            RearmQnxRegistration(ports[i], pollEvents[j].FileDescriptor);
+        }
+        pthread_mutex_unlock(&ports[i]->Lock);
+        RestoreQnxSignals(&signals);
+    }
+}
+
+static int32_t CreateSocketEventPortInner(int32_t* port)
+{
+    assert(port != NULL);
+    *port = -1;
+
+    long openMax = sysconf(_SC_OPEN_MAX);
+    int capacity = openMax > 0 && openMax <= QNX_FD_MASK ? (int)openMax : 1024;
+    QnxEventPort* p = (QnxEventPort*)calloc(1, sizeof(QnxEventPort));
+    QnxRegistration* regs = (QnxRegistration*)calloc((size_t)capacity, sizeof(QnxRegistration));
+    if (p == NULL || regs == NULL)
+    {
+        free(p);
+        free(regs);
+        return Error_ENOMEM;
+    }
+
+    int error = 0;
+    p->Registrations = regs;
+    p->Capacity = capacity;
+    p->Chid = ChannelCreate(_NTO_CHF_PRIVATE | _NTO_CHF_FIXED_PRIORITY);
+    p->Coid = p->Chid == -1 ? -1 : ConnectAttach(0, 0, p->Chid, _NTO_SIDE_CHANNEL, 0);
+    p->KeyFd = p->Coid == -1 ? -1 : open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (p->KeyFd == -1 || (error = pthread_mutex_init(&p->Lock, NULL)) != 0)
+    {
+        error = error != 0 ? error : errno;
+        if (p->KeyFd != -1)
+        {
+            close(p->KeyFd);
+        }
+        if (p->Coid != -1)
+        {
+            ConnectDetach(p->Coid);
+        }
+        if (p->Chid != -1)
+        {
+            ChannelDestroy(p->Chid);
+        }
+        free(regs);
+        free(p);
+        return SystemNative_ConvertErrorPlatformToPal(error);
+    }
+
+    pthread_mutex_lock(&s_qnxPortsLock);
+    p->Next = s_qnxPorts;
+    s_qnxPorts = p;
+    pthread_mutex_unlock(&s_qnxPortsLock);
+
+    *port = p->KeyFd;
+    return Error_SUCCESS;
+}
+
+// Only called when the managed engine fails to start. Any thread's close() or poll() may still hold the port from a
+// snapshot (SystemNative_QnxForgetFd, SystemNative_QnxRearmPolled), so the struct, its lock and its table are never
+// freed: only the OS resources are released, under the lock. A small leak on a failure path.
+static int32_t CloseSocketEventPortInner(int32_t port)
+{
+    pthread_mutex_lock(&s_qnxPortsLock);
+    QnxEventPort** link = &s_qnxPorts;
+    while (*link != NULL && (*link)->KeyFd != port)
+    {
+        link = &(*link)->Next;
+    }
+    QnxEventPort* p = *link;
+    if (p != NULL)
+    {
+        *link = p->Next;
+    }
+    pthread_mutex_unlock(&s_qnxPortsLock);
+    if (p == NULL)
+    {
+        return Error_EBADF;
+    }
+
+    sigset_t signals;
+    BlockQnxSignals(&signals);
+    pthread_mutex_lock(&p->Lock);
+    for (int fd = 0; fd < p->Capacity; fd++)
+    {
+        UnregisterQnxRegistration(&p->Registrations[fd]);
+    }
+    ConnectDetach(p->Coid);
+    ChannelDestroy(p->Chid);
+    int err = close(p->KeyFd);
+    int closeErrno = errno;
+    pthread_mutex_unlock(&p->Lock);
+    RestoreQnxSignals(&signals);
+    return err == 0 || (err < 0 && closeErrno == EINTR) ? Error_SUCCESS : SystemNative_ConvertErrorPlatformToPal(closeErrno);
+}
+
+static int32_t TryChangeSocketEventRegistrationInner(
+    int32_t port, int32_t socket, SocketEvents currentEvents, SocketEvents newEvents, uintptr_t data)
+{
+    (void)currentEvents;
+    QnxEventPort* p = FindQnxPort(port);
+    if (p == NULL)
+    {
+        return Error_EBADF;
+    }
+    if (socket > QNX_FD_MASK)
+    {
+        return Error_EINVAL;
+    }
+
+    int32_t result = Error_SUCCESS;
+    sigset_t signals;
+    BlockQnxSignals(&signals);
+    pthread_mutex_lock(&p->Lock);
+    if (!EnsureQnxCapacity(p, socket))
+    {
+        result = Error_ENOMEM;
+    }
+    else if (newEvents == SocketEvents_SA_NONE)
+    {
+        ionotify(socket, _NOTIFY_ACTION_POLL, QNX_NOTIFY_CONDS, NULL); // disarms; the fd may already be closed
+        UnregisterQnxRegistration(&p->Registrations[socket]);
+    }
+    else
+    {
+        // A registration left by a closed socket whose fd number was reused is replaced.
+        QnxRegistration* reg = &p->Registrations[socket];
+        UnregisterQnxRegistration(reg);
+        reg->Generation++;
+        SIGEV_PULSE_INT_INIT(&reg->Event, p->Coid, SIGEV_PULSE_PRIO_INHERIT, QNX_PULSE_CODE, QnxPulseValue(socket, reg));
+        if (MsgRegisterEvent(&reg->Event, socket) == -1)
+        {
+            result = SystemNative_ConvertErrorPlatformToPal(errno);
+        }
+        else
+        {
+            reg->Registered = true;
+            reg->Data = data;
+            reg->Mask = newEvents;
+            reg->Type = GetQnxObjectType(socket);
+            bool armed;
+            int met = ArmQnxRegistration(reg, socket, &armed);
+            if (met < 0)
+            {
+                result = SystemNative_ConvertErrorPlatformToPal(errno);
+                UnregisterQnxRegistration(reg);
+            }
+            else if (met != 0 || !armed)
+            {
+                // Conditions already met, or arming that kept being overtaken: the event thread reports and re-arms.
+                reg->Pending |= met;
+                if (MsgSendPulse(p->Coid, -1, QNX_PULSE_CODE, QnxPulseValue(socket, reg)) == -1)
+                {
+                    result = SystemNative_ConvertErrorPlatformToPal(errno);
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&p->Lock);
+    RestoreQnxSignals(&signals);
+    return result;
+}
+
+// Reports the registration a pulse names, after re-arming it. Returns the event count added to buffer (0 or 1).
+static int HandleQnxPulse(QnxEventPort* p, int value, SocketEvent* event)
+{
+    int fd = value & QNX_FD_MASK;
+    uint32_t generation = (uint32_t)value >> QNX_FD_BITS;
+    int32_t events = 0;
+    uintptr_t data = 0;
+    sigset_t signals;
+    BlockQnxSignals(&signals);
+    pthread_mutex_lock(&p->Lock);
+    QnxRegistration* reg = fd < p->Capacity ? &p->Registrations[fd] : NULL;
+    if (reg != NULL && reg->Registered && (reg->Generation & QNX_GENERATION_MASK) == generation)
+    {
+        int conds = reg->Pending;
+        reg->Pending = 0;
+        data = reg->Data;
+        bool armed;
+        int met = ArmQnxRegistration(reg, fd, &armed);
+        if (met < 0)
+        {
+            // The fd was closed (EBADF): the registration is gone. Any other failure keeps it: let both queues retry
+            // and arm again after this batch.
+            if (errno != EBADF)
+            {
+                conds |= QNX_NOTIFY_CONDS;
+                MsgSendPulse(p->Coid, -1, QNX_PULSE_CODE, QnxPulseValue(fd, reg));
+            }
+        }
+        else if (!armed && GetQnxObjectType(fd) != reg->Type)
+        {
+            // Arming never settles on an object of another kind that reused a closed socket's fd number (a file that
+            // is always ready, say): drop the stale registration instead of re-arming it forever.
+            UnregisterQnxRegistration(reg);
+            conds = 0;
+        }
+        else
+        {
+            conds |= met;
+            if (!armed)
+            {
+                // Still changing after QNX_ARM_ATTEMPTS: come back once this batch has been handled.
+                MsgSendPulse(p->Coid, -1, QNX_PULSE_CODE, QnxPulseValue(fd, reg));
+            }
+        }
+        events = GetQnxSocketEvents(conds, reg->Mask);
+    }
+    pthread_mutex_unlock(&p->Lock);
+    RestoreQnxSignals(&signals);
+    if (events == 0)
+    {
+        return 0;
+    }
+    memset(event, 0, sizeof(SocketEvent));
+    event->Data = data;
+    event->Events = events;
+    return 1;
+}
+
+static int32_t WaitForSocketEventsInner(int32_t port, SocketEvent* buffer, int32_t* count)
+{
+    assert(buffer != NULL);
+    assert(count != NULL);
+    assert(*count >= 0);
+
+    QnxEventPort* p = FindQnxPort(port);
+    if (p == NULL)
+    {
+        *count = 0;
+        return Error_EBADF;
+    }
+
+    // Like epoll_wait with an infinite timeout, never return 0 events: pulses for unregistered or closed fds are
+    // dropped and the wait goes on.
+    int numEvents = 0;
+    while (numEvents == 0 && *count > 0)
+    {
+        bool block = true; // the first receive blocks; the rest only drain pulses already queued
+        while (numEvents < *count)
+        {
+            struct _pulse pulse;
+            if (!block)
+            {
+                TimerTimeout(CLOCK_MONOTONIC, _NTO_TIMEOUT_RECEIVE, NULL, NULL, NULL); // immediate timeout
+            }
+            if (MsgReceivePulse(p->Chid, &pulse, sizeof(pulse), NULL) == -1)
+            {
+                if (errno == EINTR && block)
+                {
+                    continue; // a signal, such as a GC stop: wait again
+                }
+                if (errno == ETIMEDOUT || errno == EINTR)
+                {
+                    break; // drained
+                }
+                *count = 0;
+                return SystemNative_ConvertErrorPlatformToPal(errno);
+            }
+            block = false;
+            if (pulse.code == QNX_PULSE_CODE)
+            {
+                numEvents += HandleQnxPulse(p, pulse.value.sival_int, &buffer[numEvents]);
+            }
+        }
     }
 
     *count = numEvents;

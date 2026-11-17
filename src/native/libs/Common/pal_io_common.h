@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <poll.h>
+#include <time.h>
 #include <pal_error_common.h>
 #include <pal_utilities.h>
 
@@ -176,8 +177,67 @@ inline static int32_t Common_Poll(PollEvent* pollEvents, uint32_t eventCount, in
         pollfds[i].revents = 0;
     }
 
+    // After EINTR, or a timeout reported before the deadline, poll again only for the time left: restarting the full
+    // timeout would stretch the wait by up to one timeout per signal. Elapsed time is rounded down, so the wait never
+    // ends early. On QNX, which has no SA_RESTART, every GC stop signal interrupts a poll, and an interrupted poll can
+    // also come back as a timeout before its time (qflat).
     int rv;
-    while ((rv = poll(pollfds, (nfds_t)eventCount, milliseconds)) < 0 && errno == EINTR);
+    int32_t remaining = milliseconds;
+    struct timespec start;
+    bool timed = milliseconds > 0 && clock_gettime(CLOCK_MONOTONIC, &start) == 0;
+    while (true)
+    {
+        rv = poll(pollfds, (nfds_t)eventCount, remaining);
+        if (rv > 0)
+        {
+            // Only a requested event, or an error/hang-up/invalid fd (always reported), ends the wait. A return with
+            // none of them is spurious, like a wakeup by a signal on QNX, and is treated as an early timeout.
+            bool any = false;
+            for (uint32_t i = 0; i < eventCount && !any; i++)
+            {
+                any = (pollfds[i].revents & (pollfds[i].events | POLLERR | POLLHUP | POLLNVAL)) != 0;
+            }
+            if (any)
+            {
+                break;
+            }
+            for (uint32_t i = 0; i < eventCount; i++)
+            {
+                pollfds[i].revents = 0;
+            }
+            rv = 0;
+        }
+        if (rv == 0 && milliseconds < 0)
+        {
+            continue; // an infinite wait never times out
+        }
+        if (!(rv < 0 && errno == EINTR) && !(rv == 0 && timed))
+        {
+            break;
+        }
+        struct timespec now;
+        if (!timed || clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        {
+            if (rv == 0)
+            {
+                break;
+            }
+            continue;
+        }
+        // Rounded down from the whole difference: dividing the nanosecond part on its own would round a negative one
+        // toward zero, which counts up to 1 ms too much.
+        int64_t elapsed = ((int64_t)(now.tv_sec - start.tv_sec) * 1000000000 + (now.tv_nsec - start.tv_nsec)) / 1000000;
+        if (elapsed >= milliseconds)
+        {
+            if (rv == 0)
+            {
+                break; // a genuine timeout
+            }
+            remaining = 0; // interrupted at the deadline: one last non-blocking poll
+            continue;
+        }
+        remaining = milliseconds - (int32_t)elapsed;
+    }
 
     if (rv < 0)
     {

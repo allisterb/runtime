@@ -634,6 +634,11 @@ create_thread_object (void)
 	return thread;
 }
 
+#if defined(__QNXNTO__)
+/* qflat: the priority of the thread that started the runtime (mono_thread_init), which ThreadPriority.Normal maps to. */
+static int qnx_normal_priority = -1;
+#endif
+
 static void
 mono_thread_internal_set_priority (MonoInternalThread *internal, MonoThreadPriority priority)
 {
@@ -712,6 +717,16 @@ mono_thread_internal_set_priority (MonoInternalThread *internal, MonoThreadPrior
 	if ((min == -1) || (max == -1))
 		return;
 
+#if defined(__QNXNTO__)
+	/* qflat: QNX's priority range is 1..255 (63 unprivileged). Spreading the five levels over it put Normal near 128
+	 * and Highest at 255, above io-sock (21), the pipe manager (10) and drivers, so one busy thread at Normal starved
+	 * the network stack. As on Windows, Normal is the process's priority and the other levels are one or two steps
+	 * from it. */
+	if (qnx_normal_priority > 0 && max > min) {
+		int qnx_priority = qnx_normal_priority + ((int)priority - MONO_THREAD_PRIORITY_NORMAL);
+		param.sched_priority = qnx_priority < min ? min : qnx_priority > max ? max : qnx_priority;
+	} else
+#endif
 	if (max > 0 && min >= 0 && max > min) {
 		double srange, drange, sposition, dposition;
 		srange = MONO_THREAD_PRIORITY_HIGHEST - MONO_THREAD_PRIORITY_LOWEST;
@@ -2583,6 +2598,14 @@ void mono_thread_init (MonoThreadStartCB start_cb,
 	mono_thread_start_cb = start_cb;
 	mono_thread_attach_cb = attach_cb;
 
+#if defined(__QNXNTO__)
+	{
+		int policy;
+		struct sched_param param;
+		if (pthread_getschedparam (pthread_self (), &policy, &param) == 0)
+			qnx_normal_priority = param.sched_priority;
+	}
+#endif
 }
 
 static gpointer
