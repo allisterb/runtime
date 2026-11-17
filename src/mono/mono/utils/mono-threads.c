@@ -1636,7 +1636,8 @@ sleep_interrupt (gpointer data)
 static guint32
 sleep_interruptible (guint32 ms, gboolean *alerted)
 {
-	gint64 now = 0, end = 0;
+	gint64 deadline = 0;
+	guint32 remaining = 0;
 
 	g_assert (MONO_INFINITE_WAIT == G_MAXUINT32);
 
@@ -1644,7 +1645,7 @@ sleep_interruptible (guint32 ms, gboolean *alerted)
 	*alerted = FALSE;
 
 	if (ms != MONO_INFINITE_WAIT)
-		end = mono_msec_ticks() + ms;
+		deadline = mono_wait_deadline (ms);
 
 	mono_lazy_initialize (&sleep_init, sleep_initialize);
 
@@ -1652,8 +1653,8 @@ sleep_interruptible (guint32 ms, gboolean *alerted)
 
 	for (;;) {
 		if (ms != MONO_INFINITE_WAIT) {
-			now = mono_msec_ticks();
-			if (now >= end)
+			remaining = mono_wait_remaining_ms (deadline);
+			if (remaining == 0)
 				break;
 		}
 
@@ -1664,7 +1665,7 @@ sleep_interruptible (guint32 ms, gboolean *alerted)
 		}
 
 		if (ms != MONO_INFINITE_WAIT)
-			mono_coop_cond_timedwait (&sleep_cond, &sleep_mutex, GUINT64_TO_UINT32 (end - now));
+			mono_coop_cond_timedwait (&sleep_cond, &sleep_mutex, remaining);
 		else
 			mono_coop_cond_wait (&sleep_cond, &sleep_mutex);
 

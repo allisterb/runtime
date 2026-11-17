@@ -796,7 +796,7 @@ mono_monitor_try_enter_inflated (MonoObject *obj, guint32 ms, gboolean allow_int
 {
 	LockWord lw;
 	MonoThreadsSync *mon;
-	gint64 then = 0, now, delta;
+	gint64 deadline = 0;
 	guint32 waitms;
 	guint32 new_status, old_status, tmp_status;
 	MonoInternalThread *thread;
@@ -856,6 +856,8 @@ retry:
 
 	/* Make sure the sync primitives are created */
 	mon_init_cond_var (mon);
+	if (ms != MONO_INFINITE_WAIT)
+		deadline = mono_wait_deadline (ms);
 retry_contended:
 	/* a small amount of duplicated code, but it allows us to insert the profiler
 	 * callbacks without impacting the fast path: from here on we don't need to go back to the
@@ -898,10 +900,8 @@ retry_contended:
 		goto retry_contended;
 	}
 
-	if (ms != MONO_INFINITE_WAIT) {
-		then = mono_msec_ticks ();
-	}
-	waitms = ms;
+	/* 0 once the deadline has passed: the timed wait then returns -1 at once and we time out */
+	waitms = ms == MONO_INFINITE_WAIT ? ms : mono_wait_remaining_ms (deadline);
 
 	thread = mono_thread_internal_current ();
 
@@ -933,19 +933,6 @@ retry_contended:
 		 */
 		if ((interrupted && !mono_thread_test_state (mono_thread_internal_current (), ThreadState_SuspendRequested | ThreadState_AbortRequested)) || !interrupted) {
 			/* We were interrupted (and allow_interruption is FALSE) or we were signaled */
-			if (ms != MONO_INFINITE_WAIT) {
-				now = mono_msec_ticks ();
-
-				/* it should not overflow before ~30k years */
-				g_assert (now >= then);
-
-				delta = now - then;
-				if (delta >= ms) {
-					ms = 0;
-				} else {
-					ms -= GINT64_TO_UINT32 (delta);
-				}
-			}
 			/* retry from the top */
 			goto retry_contended;
 		}

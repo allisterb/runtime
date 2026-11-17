@@ -674,7 +674,7 @@ mono_w32handle_wait_one (gpointer handle, guint32 timeout, gboolean alertable)
 	MonoW32Handle *handle_data;
 	MonoW32HandleWaitRet ret;
 	gboolean alerted;
-	gint64 start = 0;
+	gint64 deadline = 0;
 	gboolean abandoned = FALSE;
 
 	alerted = FALSE;
@@ -708,7 +708,7 @@ mono_w32handle_wait_one (gpointer handle, guint32 timeout, gboolean alertable)
 	}
 
 	if (timeout != MONO_INFINITE_WAIT)
-		start = mono_msec_ticks ();
+		deadline = mono_wait_deadline (timeout);
 
 	mono_w32handle_set_in_use (handle_data, TRUE);
 
@@ -727,15 +727,15 @@ mono_w32handle_wait_one (gpointer handle, guint32 timeout, gboolean alertable)
 		if (timeout == MONO_INFINITE_WAIT) {
 			waited = mono_w32handle_timedwait_signal_handle (handle_data, MONO_INFINITE_WAIT, FALSE, alertable ? &alerted : NULL);
 		} else {
-			gint64 elapsed;
+			guint32 remaining;
 
-			elapsed = mono_msec_ticks () - start;
-			if (elapsed > timeout) {
+			remaining = mono_wait_remaining_ms (deadline);
+			if (remaining == 0) {
 				ret = MONO_W32HANDLE_WAIT_RET_TIMEOUT;
 				goto done;
 			}
 
-			waited = mono_w32handle_timedwait_signal_handle (handle_data, timeout - elapsed, FALSE, alertable ? &alerted : NULL);
+			waited = mono_w32handle_timedwait_signal_handle (handle_data, remaining, FALSE, alertable ? &alerted : NULL);
 		}
 
 		if (alerted) {

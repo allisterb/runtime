@@ -1,6 +1,7 @@
 #include <config.h>
 #include <glib.h>
 #include <mono/utils/lifo-semaphore.h>
+#include <mono/utils/mono-time.h>
 
 #if defined(HOST_BROWSER) && !defined(DISABLE_THREADS)
 #include <emscripten/eventloop.h>
@@ -49,10 +50,13 @@ mono_lifo_semaphore_timed_wait (LifoSemaphore *semaphore, int32_t timeout_ms)
 		semaphore->head->previous = &wait_entry;
 	semaphore->head = &wait_entry;
 
-	// Wait for a signal or timeout
+	// Wait for a signal or timeout. After a spurious wakeup wait only for the time left, not the full timeout again:
+	// on QNX every GC suspend signal is one, so idle workers would never time out (qflat).
 	int wait_error = 0;
+	gint64 deadline = timeout_ms < 0 ? 0 : mono_wait_deadline ((guint32)timeout_ms);
 	do {
-		wait_error = mono_coop_cond_timedwait (&wait_entry.condition, &semaphore->mutex, timeout_ms);
+		guint32 wait_ms = timeout_ms < 0 ? MONO_INFINITE_WAIT : mono_wait_remaining_ms (deadline);
+		wait_error = mono_coop_cond_timedwait (&wait_entry.condition, &semaphore->mutex, wait_ms);
 	} while (wait_error == 0 && !wait_entry.signaled);
 
 	if (wait_error == -1) {

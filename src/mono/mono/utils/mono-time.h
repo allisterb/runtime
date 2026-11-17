@@ -17,6 +17,25 @@ MONO_COMPONENT_API gint64 mono_msec_ticks (void);
 /* Returns the number of 100ns ticks from unspecified time: this should be monotonic */
 MONO_COMPONENT_API gint64 mono_100ns_ticks (void);
 
+/*
+ * Timed-wait loops: a deadline in mono_100ns_ticks, and the milliseconds left until it, rounded up (0 once it has
+ * passed). A loop that re-waits after an early wakeup must not count elapsed time in whole mono_msec_ticks: both ends
+ * are truncated, so it can see the full timeout as elapsed up to 1 ms early. On QNX (no SA_RESTART) every GC suspend
+ * signal wakes condition waits with success, so this matters there (qflat).
+ */
+static inline gint64
+mono_wait_deadline (guint32 timeout_ms)
+{
+	return mono_100ns_ticks () + (gint64)timeout_ms * 10000;
+}
+
+static inline guint32
+mono_wait_remaining_ms (gint64 deadline)
+{
+	gint64 left = deadline - mono_100ns_ticks ();
+	return left <= 0 ? 0 : (guint32)((left + 9999) / 10000);
+}
+
 /* Returns the number of 100ns ticks since 1/1/1601, UTC timezone */
 gint64 mono_100ns_datetime (void);
 

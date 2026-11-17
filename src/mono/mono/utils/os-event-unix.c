@@ -120,7 +120,7 @@ mono_os_event_wait_multiple (MonoOSEvent **events, gsize nevents, gboolean waita
 	mono_cond_t signal_cond;
 	OSEventWaitData *data = NULL;
 	gboolean alerted;
-	gint64 start = 0;
+	gint64 deadline = 0;
 	gint i;
 
 	g_assert (mono_lazy_is_initialized (&status));
@@ -147,7 +147,7 @@ mono_os_event_wait_multiple (MonoOSEvent **events, gsize nevents, gboolean waita
 	}
 
 	if (timeout != MONO_INFINITE_WAIT)
-		start = mono_msec_ticks ();
+		deadline = mono_wait_deadline (timeout);
 
 	mono_os_cond_init (&signal_cond);
 
@@ -189,16 +189,16 @@ mono_os_event_wait_multiple (MonoOSEvent **events, gsize nevents, gboolean waita
 		if (timeout == MONO_INFINITE_WAIT) {
 			mono_os_cond_wait (&signal_cond, &signal_mutex);
 		} else {
-			gint64 elapsed;
+			guint32 remaining;
 			gint res;
 
-			elapsed = mono_msec_ticks () - start;
-			if (elapsed >= timeout) {
+			remaining = mono_wait_remaining_ms (deadline);
+			if (remaining == 0) {
 				ret = MONO_OS_EVENT_WAIT_RET_TIMEOUT;
 				goto done;
 			}
 
-			res = mono_os_cond_timedwait (&signal_cond, &signal_mutex, timeout - elapsed);
+			res = mono_os_cond_timedwait (&signal_cond, &signal_mutex, remaining);
 			if (res != 0) {
 				ret = MONO_OS_EVENT_WAIT_RET_TIMEOUT;
 				goto done;

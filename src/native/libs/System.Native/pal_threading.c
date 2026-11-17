@@ -30,6 +30,7 @@ struct LowLevelMonitor
 {
     pthread_mutex_t Mutex;
     pthread_cond_t Condition;
+    uint32_t SignalCount; // bumped by Signal_Release, so TimedWait can tell a signal from a spurious wakeup
 #ifdef DEBUG
     bool IsLocked;
 #endif
@@ -92,6 +93,7 @@ LowLevelMonitor* SystemNative_LowLevelMonitor_Create(void)
         goto mutex_destroy;
     }
 
+    monitor->SignalCount = 0;
 #ifdef DEBUG
     monitor->IsLocked = false;
 #endif
@@ -190,7 +192,14 @@ int32_t SystemNative_LowLevelMonitor_TimedWait(LowLevelMonitor *monitor, int32_t
     timeoutTimeSpec.tv_sec += nanoseconds / (1000 * 1000 * 1000);
     timeoutTimeSpec.tv_nsec = nanoseconds % (1000 * 1000 * 1000);
 
-    error = pthread_cond_timedwait(&monitor->Condition, &monitor->Mutex, &timeoutTimeSpec);
+    // Wait again, for the same deadline, after a spurious wakeup (one with no Signal_Release since the wait began).
+    // The managed caller re-checks elapsed time in whole milliseconds and so would time out up to 1 ms early. On QNX,
+    // which has no SA_RESTART, every signal to the thread (each Boehm GC stop) returns EOK here (qflat).
+    uint32_t signalCount = monitor->SignalCount;
+    do
+    {
+        error = pthread_cond_timedwait(&monitor->Condition, &monitor->Mutex, &timeoutTimeSpec);
+    } while ((error == 0 && monitor->SignalCount == signalCount) || error == EINTR);
 #endif
     assert(error == 0 || error == ETIMEDOUT);
 
@@ -205,6 +214,7 @@ void SystemNative_LowLevelMonitor_Signal_Release(LowLevelMonitor* monitor)
 
     int error;
 
+    monitor->SignalCount++;
     error = pthread_cond_signal(&monitor->Condition);
     assert(error == 0);
 
