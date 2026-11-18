@@ -90,6 +90,16 @@ static MonoMethod *finalize_helper;
  */
 static GHashTable *finalizable_objects_hash;
 static mono_mutex_t finalizable_objects_hash_lock;
+/* qflat: objects with finalizers are registered during startup, before mono_gc_init (seen with Boehm on QNX:
+ * mono_object_new_mature). Without lazy initialization they went into a NULL table under an uninitialized lock. */
+static mono_lazy_init_t finalizable_objects_inited = MONO_LAZY_INIT_STATUS_NOT_INITIALIZED;
+
+static void
+finalizable_objects_init (void)
+{
+	mono_os_mutex_init_recursive (&finalizable_objects_hash_lock);
+	finalizable_objects_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
+}
 
 #ifdef TARGET_WIN32
 static HANDLE pending_done_event;
@@ -328,6 +338,7 @@ object_register_finalizer (MonoObject *obj, void (*callback)(void *, void*))
 	g_assert (obj != NULL);
 
 #if HAVE_BOEHM_GC
+	mono_lazy_initialize (&finalizable_objects_inited, finalizable_objects_init);
 	finalizers_lock ();
 
 	if (callback)
@@ -919,8 +930,7 @@ mono_gc_init (void)
 {
 	mono_lazy_initialize (&reference_queue_mutex_inited, reference_queue_mutex_init);
 	mono_coop_mutex_init_recursive (&finalizer_mutex);
-	mono_os_mutex_init_recursive (&finalizable_objects_hash_lock);
-	finalizable_objects_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
+	mono_lazy_initialize (&finalizable_objects_inited, finalizable_objects_init);
 
 	mono_counters_register ("Minor GC collections", MONO_COUNTER_GC | MONO_COUNTER_INT, &mono_gc_stats.minor_gc_count);
 	mono_counters_register ("Major GC collections", MONO_COUNTER_GC | MONO_COUNTER_INT, &mono_gc_stats.major_gc_count);
