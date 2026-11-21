@@ -10165,6 +10165,14 @@ calli_end:
 				klass = NULL;
 				field = mono_field_from_token_checked (image, token, &klass, generic_context, cfg->error);
 				if (!field || CLASS_HAS_FAILURE (klass)) {
+						/*
+						 * JIT: a missing field on a class that loaded fine leaves the MissingField error in
+						 * cfg->error. TYPE_LOAD_ERROR (klass) would then produce no exception, and the failed
+						 * compile would be taken for a successful one with no code. Report the error instead.
+						 * A failed klass (or none) keeps the TypeLoadException path.
+						 */
+						if (!cfg->compile_aot && klass && !CLASS_HAS_FAILURE (klass))
+							CHECK_CFG_ERROR;
 						HANDLE_TYPELOAD_ERROR (cfg, klass);
 
 						/*

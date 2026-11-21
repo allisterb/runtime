@@ -244,11 +244,12 @@ mono_error_get_message (MonoError *oerror)
 	if (error->full_message_with_fields)
 		return error->full_message_with_fields;
 
+	// Spell out glibc's "(null)": QNX's printf faults on a NULL %s, and member_name is often unset.
 	error->full_message_with_fields = g_strdup_printf ("%s assembly:%s type:%s member:%s",
-		error->full_message,
+		error->full_message ? error->full_message : "(null)",
 		get_assembly_name (error),
 		get_type_name (error),
-		error->member_name);
+		error->member_name ? error->member_name : "(null)");
 
 	return error->full_message_with_fields ? error->full_message_with_fields : error->full_message;
 }
@@ -738,7 +739,8 @@ mono_error_prepare_exception (MonoError *oerror, MonoError *error_out)
 			if (!type_name)
 				goto out_of_memory;
 		}
-		message = g_strdup_printf ("Error in %s:%s %s", type_name, error->member_name, error->full_message);
+		message = g_strdup_printf ("Error in %s:%s %s", type_name ? type_name : "(null)",
+			error->member_name ? error->member_name : "(null)", error->full_message ? error->full_message : "(null)");
 		if (!message)
 			goto out_of_memory;
 		exception = mono_exception_new_by_name_msg (mono_defaults.corlib, "System.Security", "VerificationException", message, error_out);
