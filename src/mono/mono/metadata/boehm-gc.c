@@ -660,6 +660,15 @@ push_interp_slot (gpointer *slot, gpointer gc_data)
 static void
 mono_push_other_roots (void)
 {
+	/*
+	 * qflat: Boehm's own pusher first. It queues each thread stack as a range (GC_push_all_stack -> GC_push_all), which
+	 * aborts with "Unexpected mark stack overflow" when the stack is full. The eager pushes below can fill it with the
+	 * objects they find; that overflow is safe (the mark state becomes invalid and the roots are pushed again), but
+	 * only if no range is queued after it. Keep every eager push after this call: the only one bdwgc does before it
+	 * is GC_push_current_stack, the collector's own few frames.
+	 */
+	if (default_push_other_roots)
+		default_push_other_roots ();
 	g_hash_table_foreach (roots, push_root, NULL);
 	/*
 	 * qflat: other threads' handle stacks and interpreter frames are walked only with the world stopped. Incremental
@@ -676,8 +685,6 @@ mono_push_other_roots (void)
 				gc_callbacks.interp_mark_func (info, push_interp_slot, NULL, FALSE);
 		} FOREACH_THREAD_END
 	}
-	if (default_push_other_roots)
-		default_push_other_roots ();
 }
 
 static void
