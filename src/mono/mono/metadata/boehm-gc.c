@@ -926,23 +926,37 @@ mono_gc_alloc_pinned_obj (MonoVTable *vtable, size_t size)
 	return mono_gc_alloc_obj (vtable, size);
 }
 
+/*
+ * Finalizers taken off Boehm's queue that have not finished running, like SGen's pending_unqueued_finalizer:
+ * without it, GC.WaitForPendingFinalizers () sees an empty queue and returns while a finalizer is still running.
+ */
+static gint32 finalizers_running;
+
 int
 mono_gc_invoke_finalizers (void)
 {
+	int count = 0;
+
+	/* Counted before GC_invoke_finalizers dequeues, so an empty queue never hides a running finalizer. */
+	mono_atomic_inc_i32 (&finalizers_running);
 	/* There is a bug in GC_invoke_finalizer () in versions <= 6.2alpha4:
 	 * the 'mem_freed' variable is not initialized when there are no
 	 * objects to finalize, which leads to strange behavior later on.
 	 * The check is necessary to work around that bug.
 	 */
 	if (GC_should_invoke_finalizers ())
-		return GC_invoke_finalizers ();
-	return 0;
+		count = GC_invoke_finalizers ();
+	mono_atomic_dec_i32 (&finalizers_running);
+	return count;
 }
 
 MonoBoolean
 mono_gc_pending_finalizers (void)
 {
-	return GC_should_invoke_finalizers ();
+	/* The queue first: an object that has left it was dequeued after finalizers_running went up. */
+	if (GC_should_invoke_finalizers ())
+		return TRUE;
+	return mono_atomic_load_i32 (&finalizers_running) > 0;
 }
 
 void
