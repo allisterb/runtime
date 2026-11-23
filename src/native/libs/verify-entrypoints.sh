@@ -18,6 +18,8 @@ for line in $($nmCommand $1); do
       init) ;;
       fini) ;;
       etext) ;;
+      # _btext is exported by QNX's C runtime start files
+      btext) ;;
       # _chk_fail & _stack_chk_fail are present in Haiku builds
       _chk_fail) ;;
       _stack_chk_fail) ;;

@@ -1729,7 +1729,14 @@ mono_gchandle_free_internal (MonoGCHandle gch)
 guint64
 mono_gc_get_total_allocated_bytes (MonoBoolean precise)
 {
-	return 0;
+	/*
+	 * qflat: bdwgc's running total (under the GC lock). It only ever over-counts: a thread-local free list is counted
+	 * whole when it is refilled, and a dead thread's unused objects are counted again when they are reused. Nothing
+	 * finer exists for precise=true.
+	 */
+	GC_word total;
+	GC_get_heap_usage_safe (NULL, NULL, NULL, NULL, &total);
+	return total;
 }
 
 void
@@ -1753,12 +1760,20 @@ mono_gc_get_gcmemoryinfo (
 	gint64 *heap_size_bytes,
 	gint64 *fragmented_bytes)
 {
+	/*
+	 * qflat: the heap figures from bdwgc, read now (SGen keeps a snapshot from its last collection): the heap it has
+	 * mapped and, as fragmentation, its free whole heap blocks only. Free small-object slots and unswept dead objects
+	 * count as in use, so heap - fragmented is the same figure as GC.GetTotalMemory. The memory-load fields stay 0;
+	 * nothing on this path measures the machine.
+	 */
+	GC_word heap, free_bytes;
+	GC_get_heap_usage_safe (&heap, &free_bytes, NULL, NULL, NULL);
 	*high_memory_load_threshold_bytes = 0;
 	*memory_load_bytes = 0;
 	*total_available_memory_bytes = 0;
-	*total_committed_bytes = 0;
-	*heap_size_bytes = 0;
-	*fragmented_bytes = 0;
+	*total_committed_bytes = heap;
+	*heap_size_bytes = heap;
+	*fragmented_bytes = free_bytes;
 }
 
 void mono_gc_get_gctimeinfo (

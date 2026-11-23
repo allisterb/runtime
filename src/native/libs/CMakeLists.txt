@@ -153,8 +153,9 @@ if (CLR_CMAKE_TARGET_UNIX OR CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
     if (CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
         # skip for now
     elseif (CLR_CMAKE_TARGET_QNX)
-        # QNX spike: System.Native only; globalization runs invariant, and crypto/GSSAPI are not ported yet.
-        # skip for now
+        # qflat: globalization runs invariant and GSSAPI is not ported. Crypto is built non-portable, like upstream's
+        # distro builds: it links the SDP's OpenSSL 3 directly.
+        add_subdirectory(System.Security.Cryptography.Native)
     elseif (CLR_CMAKE_TARGET_APPLE)
         if (NOT CLR_CMAKE_TARGET_TVOS) # no gssapi on tvOS, see https://developer.apple.com/documentation/gss
             add_subdirectory(System.Net.Security.Native)
