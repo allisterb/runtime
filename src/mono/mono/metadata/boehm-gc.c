@@ -910,10 +910,15 @@ mono_gc_alloc_string (MonoVTable *vtable, size_t size, gint32 len)
 	if (G_UNLIKELY (!obj))
 		return NULL;
 
+	/*
+	 * qflat: GC_MALLOC_ATOMIC does not clear, and CoreLib expects new strings zeroed as SGen (and CoreCLR) give them:
+	 * e.g. new string ('\0', n) skips the fill, and builders fill strings piecemeal. Clear the characters, terminator
+	 * included, like the atomic object and array paths above.
+	 */
+	memset (obj->chars, 0, (char *)obj + size - (char *)obj->chars);
 	obj->object.vtable = vtable;
 	obj->object.synchronisation = NULL;
 	obj->length = len;
-	obj->chars [len] = 0;
 
 	if (G_UNLIKELY (mono_profiler_allocations_enabled ()))
 		MONO_PROFILER_RAISE (gc_allocation, (&obj->object));
