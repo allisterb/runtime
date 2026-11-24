@@ -50,6 +50,9 @@ fix_libc_name (const char *name)
 		return "/usr/lib/libc.dylib";
 #elif defined (__FreeBSD__)
 		return "libc.so.7";
+#elif defined (__QNXNTO__)
+		// qflat: QNX 8's libc (QNX 7's was libc.so.5); targets ship no libc.so development link.
+		return "libc.so.6";
 #elif defined (LIBC_SO)
 		return LIBC_SO;
 #else
