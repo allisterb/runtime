@@ -30,8 +30,31 @@
 #pragma clang diagnostic ignored "-Wallocator-wrappers"
 #endif // __clang__
 
+#if defined(__QNXNTO__)
+#include <errno.h>
+#include <stdint.h>
+
+// qflat: QNX's allocator was seen to return a block for sizes near SIZE_MAX once the heap holds free blocks, and
+// calloc then zeroes past it. Refuse num * size above PTRDIFF_MAX with ENOMEM, as glibc does.
+static bool TooBig(uintptr_t num, uintptr_t size)
+{
+    if (size != 0 && num > (uintptr_t)PTRDIFF_MAX / size)
+    {
+        errno = ENOMEM;
+        return true;
+    }
+    return false;
+}
+#else
+#define TooBig(num, size) (false)
+#endif
+
 void* SystemNative_AlignedAlloc(uintptr_t alignment, uintptr_t size)
 {
+    if (TooBig(1, size))
+    {
+        return NULL;
+    }
 #if HAVE_ALIGNED_ALLOC
     // We want to prefer the standardized aligned_alloc function.
     return aligned_alloc(alignment, size);
@@ -67,7 +90,7 @@ void* SystemNative_AlignedRealloc(void* ptr, uintptr_t alignment, uintptr_t new_
 
 void* SystemNative_Calloc(uintptr_t num, uintptr_t size)
 {
-    return calloc(num, size);
+    return TooBig(num, size) ? NULL : calloc(num, size);
 }
 
 void SystemNative_Free(void* ptr)
@@ -77,12 +100,12 @@ void SystemNative_Free(void* ptr)
 
 void* SystemNative_Malloc(uintptr_t size)
 {
-    return malloc(size);
+    return TooBig(1, size) ? NULL : malloc(size);
 }
 
 void* SystemNative_Realloc(void* ptr, uintptr_t new_size)
 {
-    return realloc(ptr, new_size);
+    return TooBig(1, new_size) ? NULL : realloc(ptr, new_size);
 }
 
 #if defined(__clang__)

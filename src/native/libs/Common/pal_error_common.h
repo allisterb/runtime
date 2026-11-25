@@ -618,6 +618,11 @@ inline static const char* StrErrorR(int32_t platformErrno, char* buffer, int32_t
     // an unknown error, but in the latter case a reasonable string (e.g
     // "Unknown error: 0x123") is returned.
     assert_err(error == 0 || error == EINVAL, "invalid error", error);
+#if defined(__QNXNTO__)
+    // qflat: QNX returns EINVAL without writing the buffer: write glibc's message.
+    if (error == EINVAL)
+        snprintf(buffer, (size_t)bufferSize, "Unknown error %d", platformErrno);
+#endif
     return buffer;
 #endif
 }
