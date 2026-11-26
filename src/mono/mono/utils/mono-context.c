@@ -560,6 +560,10 @@ mono_sigctx_to_monoctx (void *sigctx, MonoContext *mctx)
 	else
 		for (int i = 0; i < 32; ++i)
 			mctx->fregs [i] = 0;
+#elif defined(__QNXNTO__)
+	/* qflat: QNX's AARCH64_FPU_REGISTERS: q0..q31 as {qlo, qhi}, the layout of a little-endian __uint128_t. */
+	g_static_assert (sizeof (((ucontext_t*)0)->uc_mcontext.fpu.reg) == sizeof (mctx->fregs));
+	memcpy (mctx->fregs, ((ucontext_t*)sigctx)->uc_mcontext.fpu.reg, sizeof (mctx->fregs));
 #endif
 	/* FIXME: apple */
 #endif

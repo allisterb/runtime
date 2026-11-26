@@ -465,6 +465,13 @@
 	#define UCONTEXT_REG_SP(ctx) (((ucontext_t*)(ctx))->sc_sp)
 	#define UCONTEXT_REG_R0(ctx) (((ucontext_t*)(ctx))->sc_x [ARMREG_R0])
 	#define UCONTEXT_GREGS(ctx) (&(((ucontext_t*)(ctx))->sc_x))
+#elif defined(__QNXNTO__)
+#include <ucontext.h>
+	/* qflat: QNX's AARCH64_CPU_REGISTERS (aarch64/context.h): gpr[0..30] are x0..x30, gpr[31] is SP, elr is the PC. */
+	#define UCONTEXT_REG_PC(ctx) (((ucontext_t*)(ctx))->uc_mcontext.cpu.elr)
+	#define UCONTEXT_REG_SP(ctx) (((ucontext_t*)(ctx))->uc_mcontext.cpu.gpr [AARCH64_REG_SP])
+	#define UCONTEXT_REG_R0(ctx) (((ucontext_t*)(ctx))->uc_mcontext.cpu.gpr [ARMREG_R0])
+	#define UCONTEXT_GREGS(ctx) (&(((ucontext_t*)(ctx))->uc_mcontext.cpu.gpr))
 #elif !defined(HOST_WIN32)
 #include <ucontext.h>
 	#define UCONTEXT_REG_PC(ctx) (((ucontext_t*)(ctx))->uc_mcontext.pc)
